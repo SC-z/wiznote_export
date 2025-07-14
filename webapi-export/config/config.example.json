@@ -1,0 +1,38 @@
+{
+    "api": {
+        "as_url": "https://as.wiz.cn",
+        "timeout": 30,
+        "max_retries": 3,
+        "rate_limit_per_second": 10
+    },
+    "auth": {
+        "username": "请填写您的邮箱",
+        "password": "请填写您的密码",
+        "save_token": true,
+        "token_file": "config/.token"
+    },
+    "download": {
+        "output_dir": "./output/wiznote_backup",
+        "max_concurrent": 5,
+        "chunk_size": 1048576,
+        "resume_enabled": true,
+        "download_attachments": true
+    },
+    "sync": {
+        "incremental": true,
+        "sync_deleted": false,
+        "exclude_folders": [],
+        "last_sync_file": "config/.last_sync"
+    },
+    "format": {
+        "convert_to_markdown": true,
+        "extract_images": true,
+        "preserve_structure": true,
+        "add_metadata": false
+    },
+    "logging": {
+        "level": "INFO",
+        "log_file": "logs/wiznote_backup.log",
+        "console_output": true
+    }
+}
