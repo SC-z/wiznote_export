@@ -20,6 +20,7 @@ from dataclasses import dataclass
 import html2text
 from bs4 import BeautifulSoup
 import base64
+import mimetypes
 from urllib.parse import unquote
 
 # 配置日志
@@ -87,6 +88,11 @@ class WizNoteMigrator:
         self.h2t.protect_links = True
         self.h2t.wrap_links = False
         
+        # 若误传为文件路径，则退回到其父目录
+        if self.target_dir.suffix.lower() == '.md':
+            logger.warning(f"目标路径为文件，将使用其父目录: {self.target_dir.parent}")
+            self.target_dir = self.target_dir.parent
+        
     def find_user_data(self) -> bool:
         """查找用户数据目录"""
         # 查找邮箱目录（通常是第一个目录）
@@ -106,7 +112,6 @@ class WizNoteMigrator:
     def create_target_structure(self):
         """创建目标目录结构"""
         self.target_dir.mkdir(parents=True, exist_ok=True)
-        (self.target_dir / '_metadata').mkdir(exist_ok=True)
         logger.info(f"创建目标目录: {self.target_dir}")
     
     def connect_database(self) -> sqlite3.Connection:
@@ -246,87 +251,114 @@ class WizNoteMigrator:
         if not body:
             body = soup
         
-        # 保存提取的图片
-        saved_images = {}
-        doc_dir = self.get_document_dir(doc)
-        assets_dir = doc_dir / 'assets'
-        
-        if images:
-            assets_dir.mkdir(parents=True, exist_ok=True)
-            for img_path, img_data in images.items():
-                # 获取图片文件名
-                img_filename = os.path.basename(img_path)
-                # 保存图片
-                local_img_path = assets_dir / img_filename
-                try:
-                    with open(local_img_path, 'wb') as f:
-                        f.write(img_data)
-                    saved_images[img_path] = f"./assets/{img_filename}"
-                except Exception as e:
-                    logger.error(f"保存图片失败 {img_filename}: {e}")
+        # 构建图片 data URL 映射（不落盘）
+        image_data_urls = self.build_image_data_urls(images)
         
         # 处理HTML中的图片引用
         for img in body.find_all('img'):
-            src = img.get('src', '')
+            src = (img.get('src') or '').strip()
+            if not src:
+                continue
             
-            # 处理data URL图片
-            if src.startswith('data:image'):
-                img_path = self.save_base64_image(src, doc)
-                if img_path:
-                    img['src'] = img_path
-            # 处理本地图片引用
-            else:
-                # 首先检查是否是index_files格式的引用
-                if 'index_files/' in src:
-                    # 提取文件名
-                    img_filename = os.path.basename(src)
-                    # 查找对应的保存路径
-                    for original_path, new_path in saved_images.items():
-                        if img_filename == os.path.basename(original_path):
-                            img['src'] = new_path
-                            break
-                else:
-                    # 其他格式的图片引用
-                    for original_path, new_path in saved_images.items():
-                        if src.endswith(os.path.basename(original_path)):
-                            img['src'] = new_path
-                            break
+            # 已经是 data URL 的图片直接保留
+            if src.startswith('data:'):
+                continue
+            
+            # 处理本地图片引用，替换为 data URL
+            src_unquoted = unquote(src).replace('\\', '/')
+            src_unquoted = src_unquoted.split('?', 1)[0].split('#', 1)[0]
+            candidates = [src_unquoted, os.path.basename(src_unquoted)]
+            replaced = False
+            for key in candidates:
+                data_url = image_data_urls.get(key)
+                if data_url:
+                    img['src'] = data_url
+                    replaced = True
+                    break
+            
+            if not replaced and image_data_urls:
+                logger.warning(f"未找到图片数据: {src}")
         
         # 转换为Markdown
         markdown_content = self.h2t.handle(str(body))
+        markdown_content = self.unescape_list_markers(markdown_content)
+        markdown_content = self.normalize_blank_lines(markdown_content)
         
         # 不添加元数据，直接返回内容
         return markdown_content
+
+    def unescape_list_markers(self, text: str) -> str:
+        """恢复被转义的列表符号与分割线"""
+        if not text:
+            return text
+        lines = []
+        pattern = re.compile(r'^(\s*)\\-\s+')
+        hr_pattern = re.compile(r'^\s*\\([*_\\-]{3,})\s*$')
+        fence_pattern = re.compile(r'^\s*(```|~~~)')
+        in_fence = False
+        for line in text.splitlines():
+            if fence_pattern.match(line):
+                in_fence = not in_fence
+                lines.append(line)
+                continue
+            if in_fence:
+                lines.append(line)
+                continue
+            line = pattern.sub(r'\1- ', line)
+            if hr_pattern.match(line):
+                line = line.replace('\\', '')
+            lines.append(line)
+        return "\n".join(lines)
+
+    def normalize_blank_lines(self, text: str) -> str:
+        """压缩多余空行，保留结构所需的单个空行"""
+        if not text:
+            return text
+        lines = text.splitlines()
+        out = []
+        blank_count = 0
+        in_fence = False
+        fence_pattern = re.compile(r'^\s*(```|~~~)')
+        for line in lines:
+            if fence_pattern.match(line):
+                in_fence = not in_fence
+                out.append(line)
+                blank_count = 0
+                continue
+            if in_fence:
+                out.append(line)
+                continue
+            if line.strip() == '':
+                blank_count += 1
+                if blank_count <= 1:
+                    out.append('')
+                continue
+            blank_count = 0
+            out.append(line)
+        return "\n".join(out).rstrip() + "\n"
     
-    def save_base64_image(self, data_url: str, doc: WizDocument) -> Optional[str]:
-        """保存base64编码的图片"""
+    def build_image_data_urls(self, images: Dict[str, bytes]) -> Dict[str, str]:
+        """将图片二进制转换为 data URL 映射"""
+        image_data_urls = {}
+        for img_path, img_data in images.items():
+            data_url = self.image_bytes_to_data_url(img_data, img_path)
+            if not data_url:
+                continue
+            normalized_path = img_path.replace('\\', '/')
+            image_data_urls[normalized_path] = data_url
+            image_data_urls[os.path.basename(normalized_path)] = data_url
+        return image_data_urls
+    
+    def image_bytes_to_data_url(self, img_data: bytes, img_path: str) -> Optional[str]:
+        """将图片二进制转换为 data URL"""
         try:
-            # 解析data URL
-            header, data = data_url.split(',', 1)
-            file_type = header.split('/')[1].split(';')[0]
-            
-            # 解码base64
-            image_data = base64.b64decode(data)
-            
-            # 生成文件名
-            image_filename = f"image_{datetime.now().strftime('%Y%m%d%H%M%S')}.{file_type}"
-            
-            # 确定保存路径
-            doc_dir = self.get_document_dir(doc)
-            assets_dir = doc_dir / 'assets'
-            assets_dir.mkdir(parents=True, exist_ok=True)
-            
-            image_path = assets_dir / image_filename
-            
-            # 保存图片
-            with open(image_path, 'wb') as f:
-                f.write(image_data)
-            
-            # 返回相对路径
-            return f"./assets/{image_filename}"
-        
+            mime_type, _ = mimetypes.guess_type(img_path)
+            if not mime_type:
+                mime_type = 'image/png'
+            encoded = base64.b64encode(img_data).decode('ascii')
+            return f"data:{mime_type};base64,{encoded}"
         except Exception as e:
-            logger.error(f"保存base64图片失败: {e}")
+            logger.error(f"图片转Base64失败 {img_path}: {e}")
             return None
     
     def get_document_dir(self, doc: WizDocument) -> Path:
@@ -378,9 +410,9 @@ class WizNoteMigrator:
                 filepath = doc_dir / f"{name}_{counter}{ext}"
                 counter += 1
             
-            # 保存文件
+            block = self.format_document_block(doc, content)
             with open(filepath, 'w', encoding='utf-8') as f:
-                f.write(content)
+                f.write(block)
             
             logger.info(f"保存文档: {filepath}")
             return True
@@ -388,6 +420,12 @@ class WizNoteMigrator:
         except Exception as e:
             logger.error(f"保存文档失败 {doc.title}: {e}")
             return False
+    
+    def format_document_block(self, doc: WizDocument, content: str) -> str:
+        """构建单篇文档的Markdown块"""
+        if not content:
+            return ""
+        return content.strip() + "\n"
     
     def copy_attachment(self, doc: WizDocument, attachment: WizAttachment) -> bool:
         """复制附件文件"""
@@ -423,6 +461,11 @@ class WizNoteMigrator:
         except Exception as e:
             logger.error(f"复制附件失败 {attachment.name}: {e}")
             return False
+
+    def is_image_file(self, filename: str) -> bool:
+        """判断是否为图片文件"""
+        ext = os.path.splitext(filename)[1].lower()
+        return ext in {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg'}
     
     def migrate(self):
         """执行迁移"""
@@ -463,19 +506,19 @@ class WizNoteMigrator:
                     self.stats['failed_notes'] += 1
                     continue
                 
-                # 处理附件
+                # 处理附件（图片附件跳过）
                 if doc.attachment_count > 0:
                     attachments = self.get_document_attachments(conn, doc.guid)
                     self.stats['total_attachments'] += len(attachments)
                     
                     for att in attachments:
+                        if self.is_image_file(att.name):
+                            logger.info(f"跳过图片附件: {att.name}")
+                            continue
                         if self.copy_attachment(doc, att):
                             self.stats['migrated_attachments'] += 1
                         else:
                             self.stats['failed_attachments'] += 1
-            
-            # 保存元数据
-            self.save_metadata(documents)
             
         finally:
             conn.close()
@@ -523,6 +566,7 @@ class WizNoteMigrator:
         print(f"总附件数: {self.stats['total_attachments']}")
         print(f"成功复制: {self.stats['migrated_attachments']}")
         print(f"失败附件: {self.stats['failed_attachments']}")
+        print("图片附件: 已跳过导出")
         print("="*50)
 
 
