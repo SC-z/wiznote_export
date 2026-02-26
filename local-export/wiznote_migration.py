@@ -58,6 +58,17 @@ class WizAttachment:
     data_md5: str
 
 
+@dataclass
+class WizDataSource:
+    """导入数据源描述"""
+    source_type: str
+    source_name: str
+    db_path: Path
+    notes_dir: Path
+    attachments_dir: Optional[Path]
+    output_prefix: Optional[Path]
+
+
 class WizNoteMigrator:
     """为知笔记迁移主类"""
     
@@ -65,9 +76,12 @@ class WizNoteMigrator:
         self.source_dir = Path(source_dir)
         self.target_dir = Path(target_dir)
         self.data_dir = None
+        self.user_dir = None
         self.db_path = None
         self.notes_dir = None
         self.attachments_dir = None
+        self.current_source_name = "个人笔记"
+        self.current_output_prefix = None
         
         # 统计信息
         self.stats = {
@@ -98,6 +112,7 @@ class WizNoteMigrator:
         # 查找邮箱目录（通常是第一个目录）
         for item in self.source_dir.iterdir():
             if item.is_dir() and '@' in item.name:
+                self.user_dir = item
                 self.data_dir = item / 'data'
                 if self.data_dir.exists():
                     self.db_path = self.data_dir / 'index.db'
@@ -108,6 +123,96 @@ class WizNoteMigrator:
         
         logger.error("未找到有效的用户数据目录")
         return False
+
+    def find_group_data_sources(self) -> List[WizDataSource]:
+        """查找群组数据源"""
+        if not self.user_dir:
+            return []
+
+        group_root = self.user_dir / 'group'
+        if not group_root.exists():
+            logger.info("未找到群组目录，跳过群组导出")
+            return []
+
+        group_sources: List[WizDataSource] = []
+        used_output_names = set()
+        for group_dir in sorted(group_root.iterdir()):
+            if not group_dir.is_dir():
+                continue
+
+            db_path = group_dir / 'index.db'
+            notes_dir = group_dir / 'notes'
+            if not db_path.exists() or not notes_dir.exists():
+                logger.warning(f"群组目录缺少 index.db 或 notes，已跳过: {group_dir}")
+                continue
+
+            group_id = group_dir.name
+            group_name = self.get_meta_value(db_path, 'DATABASE', 'NAME') or group_id
+            safe_group_name = self.sanitize_path_component(group_name)
+            output_name = safe_group_name
+            if output_name in used_output_names:
+                output_name = f"{safe_group_name}__{group_id[:8]}"
+            used_output_names.add(output_name)
+
+            attachments_dir = group_dir / 'attachments'
+            source = WizDataSource(
+                source_type='group',
+                source_name=f"群组:{group_name}({group_id[:8]})",
+                db_path=db_path,
+                notes_dir=notes_dir,
+                attachments_dir=attachments_dir if attachments_dir.exists() else None,
+                output_prefix=Path('group') / output_name
+            )
+            group_sources.append(source)
+            logger.info(f"发现群组数据源: {source.source_name}")
+
+        logger.info(f"共发现 {len(group_sources)} 个群组数据源")
+        return group_sources
+
+    def get_meta_value(self, db_path: Path, meta_name: str, meta_key: str) -> Optional[str]:
+        """读取 WIZ_META 指定键值"""
+        conn = None
+        try:
+            conn = sqlite3.connect(str(db_path))
+            cursor = conn.cursor()
+            cursor.execute("""
+                SELECT META_VALUE
+                FROM WIZ_META
+                WHERE META_NAME = ? AND META_KEY = ?
+                LIMIT 1
+            """, (meta_name, meta_key))
+            row = cursor.fetchone()
+            if row and row[0]:
+                value = str(row[0]).strip()
+                if value:
+                    return value
+        except Exception as e:
+            logger.warning(f"读取元数据失败 {db_path}: {e}")
+        finally:
+            if conn is not None:
+                conn.close()
+        return None
+
+    def sanitize_path_component(self, name: str) -> str:
+        """清理单个目录名"""
+        if not name:
+            return "UnnamedGroup"
+        clean = name.strip().replace('/', '_').replace('\\', '_')
+        illegal_chars = '<>:"|?*\r\n'
+        for char in illegal_chars:
+            clean = clean.replace(char, '_')
+        clean = clean.strip().strip('.')
+        if not clean:
+            clean = "UnnamedGroup"
+        return clean[:200]
+
+    def set_active_source(self, source: WizDataSource):
+        """切换当前导出数据源"""
+        self.db_path = source.db_path
+        self.notes_dir = source.notes_dir
+        self.attachments_dir = source.attachments_dir
+        self.current_source_name = source.source_name
+        self.current_output_prefix = source.output_prefix
     
     def create_target_structure(self):
         """创建目标目录结构"""
@@ -121,7 +226,7 @@ class WizNoteMigrator:
         
         conn = sqlite3.connect(str(self.db_path))
         conn.row_factory = sqlite3.Row
-        logger.info("成功连接数据库")
+        logger.info(f"[{self.current_source_name}] 成功连接数据库")
         return conn
     
     def get_all_documents(self, conn: sqlite3.Connection) -> List[WizDocument]:
@@ -372,7 +477,10 @@ class WizNoteMigrator:
         location = location.replace('/', os.sep)
         
         # 创建目录
-        doc_dir = self.target_dir / location
+        if self.current_output_prefix is None:
+            doc_dir = self.target_dir / location
+        else:
+            doc_dir = self.target_dir / self.current_output_prefix / location
         doc_dir.mkdir(parents=True, exist_ok=True)
         
         return doc_dir
@@ -466,6 +574,57 @@ class WizNoteMigrator:
         """判断是否为图片文件"""
         ext = os.path.splitext(filename)[1].lower()
         return ext in {'.png', '.jpg', '.jpeg', '.gif', '.bmp', '.webp', '.svg'}
+
+    def migrate_data_source(self, source: WizDataSource):
+        """迁移单个数据源"""
+        self.set_active_source(source)
+        logger.info(f"开始迁移数据源: {source.source_name}")
+        if not self.attachments_dir:
+            logger.warning(f"[{source.source_name}] 未找到附件目录，附件复制将跳过")
+
+        conn = self.connect_database()
+        try:
+            # 获取所有文档
+            documents = self.get_all_documents(conn)
+            self.stats['total_notes'] += len(documents)
+
+            # 迁移每个文档
+            for i, doc in enumerate(documents, 1):
+                logger.info(f"[{source.source_name}] 处理文档 {i}/{len(documents)}: {doc.title}")
+
+                # 提取内容和图片
+                html_content, images = self.extract_note_content(doc.guid)
+                if not html_content:
+                    self.stats['failed_notes'] += 1
+                    continue
+
+                # 转换为Markdown
+                markdown_content = self.html_to_markdown(html_content, doc, images)
+
+                # 保存文档
+                if self.save_document(doc, markdown_content):
+                    self.stats['migrated_notes'] += 1
+                else:
+                    self.stats['failed_notes'] += 1
+                    continue
+
+                # 处理附件（图片附件跳过）
+                if doc.attachment_count > 0:
+                    attachments = self.get_document_attachments(conn, doc.guid)
+                    self.stats['total_attachments'] += len(attachments)
+                    if not self.attachments_dir:
+                        continue
+
+                    for att in attachments:
+                        if self.is_image_file(att.name):
+                            logger.info(f"[{source.source_name}] 跳过图片附件: {att.name}")
+                            continue
+                        if self.copy_attachment(doc, att):
+                            self.stats['migrated_attachments'] += 1
+                        else:
+                            self.stats['failed_attachments'] += 1
+        finally:
+            conn.close()
     
     def migrate(self):
         """执行迁移"""
@@ -477,51 +636,22 @@ class WizNoteMigrator:
         
         # 创建目标结构
         self.create_target_structure()
-        
-        # 连接数据库
-        conn = self.connect_database()
-        
-        try:
-            # 获取所有文档
-            documents = self.get_all_documents(conn)
-            self.stats['total_notes'] = len(documents)
-            
-            # 迁移每个文档
-            for i, doc in enumerate(documents, 1):
-                logger.info(f"处理文档 {i}/{len(documents)}: {doc.title}")
-                
-                # 提取内容和图片
-                html_content, images = self.extract_note_content(doc.guid)
-                if not html_content:
-                    self.stats['failed_notes'] += 1
-                    continue
-                
-                # 转换为Markdown
-                markdown_content = self.html_to_markdown(html_content, doc, images)
-                
-                # 保存文档
-                if self.save_document(doc, markdown_content):
-                    self.stats['migrated_notes'] += 1
-                else:
-                    self.stats['failed_notes'] += 1
-                    continue
-                
-                # 处理附件（图片附件跳过）
-                if doc.attachment_count > 0:
-                    attachments = self.get_document_attachments(conn, doc.guid)
-                    self.stats['total_attachments'] += len(attachments)
-                    
-                    for att in attachments:
-                        if self.is_image_file(att.name):
-                            logger.info(f"跳过图片附件: {att.name}")
-                            continue
-                        if self.copy_attachment(doc, att):
-                            self.stats['migrated_attachments'] += 1
-                        else:
-                            self.stats['failed_attachments'] += 1
-            
-        finally:
-            conn.close()
+
+        # 组装数据源（个人库 + 全部群组）
+        data_sources = [
+            WizDataSource(
+                source_type='personal',
+                source_name='个人笔记',
+                db_path=self.db_path,
+                notes_dir=self.notes_dir,
+                attachments_dir=self.attachments_dir if self.attachments_dir.exists() else None,
+                output_prefix=None
+            )
+        ]
+        data_sources.extend(self.find_group_data_sources())
+
+        for source in data_sources:
+            self.migrate_data_source(source)
         
         # 打印统计信息
         self.print_stats()
